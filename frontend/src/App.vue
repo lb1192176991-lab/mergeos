@@ -8084,7 +8084,9 @@ function shortLedgerReference(value = '') {
 }
 
 function paymentMethodForProject() {
-  return projectPaymentMethod.value === 'USDC' ? 'crypto' : 'paypal';
+  if (projectPaymentMethod.value === 'USDC') return 'crypto';
+  if (projectPaymentMethod.value === 'USDT') return 'usdt';
+  return 'paypal';
 }
 
 function paymentReferenceForProject() {

@@ -46,8 +46,16 @@ func (p *PaymentManager) Verify(ctx context.Context, req CreateProjectRequest) (
 			return p.verifyCrypto(ctx, reference, req.BudgetCents)
 		}
 		return p.verifyDev(reference, "dev-crypto")
+	case PaymentUSDT:
+		if p.cfg.DevPaymentEnabled && reference == p.cfg.DevPaymentCode {
+			return p.verifyDev(reference, "dev-usdt")
+		}
+		return PaymentVerification{
+			Provider:  "usdt",
+			Reference: reference,
+		}, nil
 	default:
-		return PaymentVerification{}, errors.New("payment method must be paypal or crypto")
+		return PaymentVerification{}, errors.New("payment method must be paypal, crypto, or usdt")
 	}
 }
 

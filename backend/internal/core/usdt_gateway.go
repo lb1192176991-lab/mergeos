@@ -214,18 +214,6 @@ func (m *USDTGatewayManager) handleWebhook(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// Idempotency check
-	existing := m.store.FindUSDTWebhookByIdempotencyKey(payload.IdempotencyKey)
-	if existing != nil {
-		writeJSON(w, http.StatusOK, USDTWebhookResponse{
-			Received: true,
-			EventID:  existing.ID,
-			Status:   existing.Status,
-			Message:  "duplicate webhook already processed",
-		})
-		return
-	}
-
 	// Map gateway status to internal status
 	internalStatus := mapGatewayStatus(payload.Status)
 	if internalStatus == "" {
@@ -243,6 +231,7 @@ func (m *USDTGatewayManager) handleWebhook(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Build the webhook event (with redacted payload)
 	now := time.Now().UTC()
 	event := &USDTWebhookEvent{
 		ID:              payload.EventID,
@@ -257,22 +246,32 @@ func (m *USDTGatewayManager) handleWebhook(w http.ResponseWriter, r *http.Reques
 		SenderAddress:   strings.ToLower(strings.TrimSpace(payload.Sender)),
 		ReceiverAddress: strings.ToLower(strings.TrimSpace(payload.Receiver)),
 		SignatureValid:  true,
-		RawPayload:      json.RawMessage(bodyBytes),
+		RawPayload:      redactPayload(bodyBytes),
 		ProjectID:       strings.TrimSpace(payload.ProjectID),
 		IdempotencyKey:  payload.IdempotencyKey,
 		ProcessedAt:     &now,
 		ReceivedAt:      now,
 	}
 
-	// Apply payment if confirmed
+	// Apply payment if confirmed — idempotency check is atomic inside the write lock
 	if event.Status == "confirmed" && event.ProjectID != "" {
-		if appErr := m.store.ApplyUSDTWebhookPayment(event); appErr != nil {
+		applied, appErr := m.store.ApplyUSDTWebhookPaymentIfNotProcessed(event)
+		if appErr != nil {
 			event.Error = appErr.Error()
 			event.Status = "apply_failed"
 			if saveErr := m.store.SaveUSDTWebhookEvent(event); saveErr != nil {
 				log.Printf("[usdt-gateway] failed to save apply_failed event: %v", saveErr)
 			}
 			writeError(w, http.StatusInternalServerError, "failed to apply payment")
+			return
+		}
+		if !applied {
+			writeJSON(w, http.StatusOK, USDTWebhookResponse{
+				Received: true,
+				EventID:  event.ID,
+				Status:   "duplicate",
+				Message:  "duplicate webhook already processed",
+			})
 			return
 		}
 	}
@@ -295,7 +294,7 @@ func (m *USDTGatewayManager) logWebhookEvent(raw json.RawMessage, eventID, statu
 		Provider:       provider,
 		EventType:      "webhook_callback",
 		Status:         status,
-		RawPayload:     raw,
+		RawPayload:     redactPayload(raw),
 		Error:          errMsg,
 		ProjectID:      projectID,
 		IdempotencyKey: idempotencyKey,
@@ -406,6 +405,45 @@ func (s *Store) ListUSDTWebhookEvents() []*USDTWebhookEvent {
 	return events
 }
 
+// ApplyUSDTWebhookPaymentIfNotProcessed atomically checks idempotency and applies the payment
+// under a single write lock, preventing race conditions between concurrent webhook callbacks.
+func (s *Store) ApplyUSDTWebhookPaymentIfNotProcessed(event *USDTWebhookEvent) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Idempotency check inside the write lock
+	if s.usdtWebhookEvents != nil {
+		for _, e := range s.usdtWebhookEvents {
+			if e.IdempotencyKey == event.IdempotencyKey {
+				return false, nil // already processed
+			}
+		}
+	}
+
+	project, ok := s.projects[event.ProjectID]
+	if !ok {
+		return false, fmt.Errorf("project %s not found", event.ProjectID)
+	}
+
+	// Verify the webhook amount matches the project budget
+	if event.AmountCents != project.BudgetCents {
+		return false, fmt.Errorf("webhook amount %d cents does not match project budget %d cents",
+			event.AmountCents, project.BudgetCents)
+	}
+
+	// Update project payment state
+	project.PaymentStatus = "verified"
+	project.PaymentProvider = "usdt-webhook:" + event.Provider
+	project.PaymentReference = event.TxHash
+
+	// Add ledger entries
+	clientProjectAccount := "client:" + project.ClientUserID + ":project:" + project.ID
+	s.addLedger("usdt_payment_confirmed", "payment:usdt-webhook", clientProjectAccount,
+		project.BudgetCents, event.TxHash)
+
+	return true, s.saveLocked()
+}
+
 // ApplyUSDTWebhookPayment credits a project from a confirmed USDT webhook payment.
 func (s *Store) ApplyUSDTWebhookPayment(event *USDTWebhookEvent) error {
 	s.mu.Lock()
@@ -433,4 +471,34 @@ func (s *Store) ApplyUSDTWebhookPayment(event *USDTWebhookEvent) error {
 		project.BudgetCents, event.TxHash)
 
 	return s.saveLocked()
+}
+
+// redactPayload returns a JSON-encoded redacted version of the raw webhook body,
+// stripping sensitive fields like sender/receiver addresses, tx hash, and signatures
+// before persisting to the database.
+func redactPayload(body []byte) json.RawMessage {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		// If parsing fails, store a minimal safe payload
+		safe, _ := json.Marshal(map[string]string{"error": "failed to parse payload"})
+		return json.RawMessage(safe)
+	}
+	// Remove sensitive fields
+	delete(raw, "sender_address")
+	delete(raw, "receiver_address")
+	delete(raw, "tx_hash")
+	delete(raw, "signature")
+	// Truncate signature if under different key
+	for k := range raw {
+		kl := strings.ToLower(k)
+		if kl == "sig" || kl == "sign" || kl == "hmac" {
+			delete(raw, k)
+		}
+	}
+	redacted, err := json.Marshal(raw)
+	if err != nil {
+		safe, _ := json.Marshal(map[string]string{"error": "failed to marshal redacted payload"})
+		return json.RawMessage(safe)
+	}
+	return json.RawMessage(redacted)
 }
